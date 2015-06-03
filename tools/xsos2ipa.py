@@ -24,6 +24,9 @@ import ipalib.errors
 class LdapObject(object):
 
     def __init__(self, dn, attrs):
+        #attrs2 = {}
+        #for k, v in attrs.items():
+        #    attrs2[k.lower()] = v
         object.__setattr__(self, '_LdapObject__attrs', attrs)
         object.__setattr__(self, 'dn', dn)
 
@@ -40,19 +43,22 @@ class LdapObject(object):
         s = ''.join( ( '{0}={1} '.format(k, ','.join(atts[k])) for k in atts ) )
         return '<{0} {1}>'.format(self.dn, s.rstrip(' '))
 
-    def values(self, att):
+    def values(self, att, fmt='{0}'):
         vals = object.__getattribute__(self, '_LdapObject__attrs')[att]
-        for val in vals:
-            if isinstance(vals[0], basestring):
-                yield val.decode('utf-8').strip()
-            else:
-                yield val.strip()
+        try:
+            for val in vals:
+                if isinstance(vals[0], basestring):
+                    yield fmt.format(val.decode('utf-8').strip(), **object.__getattribute__(self, '_LdapObject__attrs'))
+                else:
+                    yield fmt.format(val.strip(), **object.__getattribute__(self, '_LdapObject__attrs'))
+        except KeyError as e:
+            raise AttributeError(str(e))
 
-    def update(self, kw, att, toatt=None):
+    def update(self, kw, att, toatt=None, fmt='{0}'):
         if toatt is None:
             toatt = att.lower()
         try:
-            vals = list(self.values(att))
+            vals = list(self.values(att, fmt=fmt))
         except KeyError:
             if toatt in kw:
                 del kw[toatt]
@@ -60,37 +66,47 @@ class LdapObject(object):
             ikw = map(lambda s: s.lower(), kw.get(toatt, ()))
             for val in vals:
                 ival = val.lower()
-                if any(ival == v for v in ikw):
-                    kw[toatt].append(val)
+                if not any(ival == v for v in ikw):
+                    if toatt not in kw:
+                        kw[toatt] = [val]
+                    else:
+                        kw[toatt].append(val)
 
-    def setone(self, kw, att, toatt=None, default=None):
+    def setone(self, kw, att, toatt=None, default=None, fmt='{0}'):
         if toatt is None:
             toatt = att.lower()
         try:
-            kw[toatt] = getattr(self, att)
+            kw[toatt] = fmt.format(getattr(self, att), **object.__getattribute__(self, '_LdapObject__attrs'))
         except KeyError:
             if default:
                 kw[toatt] = default
 
 
-def ldapUsers(users, server, base):
+def ldapUsers(users, idoverrideusers, server, base):
     import ldap
     l = ldap.initialize('ldap://{0}:389'.format(server))
+    #ret = l.search_s(base, ldap.SCOPE_SUBTREE, '(objectClass=inetOrgPerson)', [str('*'), str('objectClass')])
     ret = l.search_s(base, ldap.SCOPE_SUBTREE, '(objectClass=inetOrgPerson)')
     for dn, attrs in ret:
         user = LdapObject(dn, attrs)
+        idoverride = LdapObject(
+            'uid={0},cn=users,cn=compat,dc=soseth,dc=org'.format(user.uid), {
+                #'cn': [user.cn], 
+                'objectClass': ['posixAccount', 'top'],
+                'gidNumber': ['10000'],
+                'gecos': [user.cn],
+                'uidNumber': [user.uidNumber],
+                'loginShell': ['/bin/sh'],
+                'homeDirectory': ['/home/{0}'.format(user.uid)],
+                'uid': [user.uid],
+             })
+        idoverrideusers[user.uid] = idoverride
         users[user.uid] = user
 
 
 def main(netgroup='adm-soseth'):
 
     print('Authenticating to FreeIPA...')
-    pwfn = os.path.expanduser('~/.nethz')
-    with codecs.open(pwfn, 'r', 'utf-8') as pwf:
-        comment = pwf.readline()
-        unpw = base64.b64decode(pwf.read())
-        username, password = unpw.split('\n', 1)
-    basicAuth = 'Basic %s' % base64.b64encode('%s:%s' % (username, password))
     api.bootstrap(context='example', in_server=True)
     api.finalize()
     if api.env.in_server:
@@ -102,9 +118,10 @@ def main(netgroup='adm-soseth'):
     ## sys.setrecursionlimit(20)
     print('Reading LDAP...')
     users = dict()
+    idoverrideusers = dict()
     server = sys.argv[1]
     base = sys.argv[2]
-    ldapUsers(users, server, base)
+    ldapUsers(users, idoverrideusers, server, base)
     print(' {0:d} Done'.format(len(users)))
     from ipapython.dn import DN
 
@@ -113,7 +130,7 @@ def main(netgroup='adm-soseth'):
         if len(sys.argv) > 3 and uid != sys.argv[3]:
             continue
         try:
-            result0 = api.Command.user_show(uid)
+            result0 = api.Command.user_show(uid, all=True)
             memberof_group = result0['result'].get('memberof_group', ())
             for g_protected in ('admins', 'trust_admins', 'editors'):
                 if g_protected in memberof_group:
@@ -131,7 +148,8 @@ def main(netgroup='adm-soseth'):
         user.update(kw, 'rfidKey')
         user.update(kw, 'rfidDoorAccess')
 
-        user.setone(kw, 'registeredAddress', 'mail')
+        user.update(kw, 'mail', 'edupersontargetedid', fmt='mail:{mail[0]}')
+        user.update(kw, 'registeredAddress', 'edupersontargetedid', fmt='mail:{registeredAddress[0]}')
         user.setone(kw, 'street')
         user.setone(kw, 'l')
         user.setone(kw, 'postalCode')
@@ -139,19 +157,42 @@ def main(netgroup='adm-soseth'):
 
         user.setone(kw, 'givenName', default=uid)
         user.setone(kw, 'sn')
+
+        kwovr = {}
+        userovr = idoverrideusers[user.uid]
+        #userovr.setone(kwovr, 'cn')
+        userovr.setone(kwovr, 'gecos')
+        userovr.setone(kwovr, 'loginShell')
+        userovr.setone(kwovr, 'homeDirectory')
+        userovr.setone(kwovr, 'uidNumber')
+        userovr.setone(kwovr, 'gidNumber')
+        kwovr['uidnumber'] = int(kwovr['uidnumber'])
+        kwovr['gidnumber'] = int(kwovr['gidnumber'])
+
+        #print(user)
+        #for k, v in kw.items():
+        #    print("{0}: {1}".format(k, v))
+        #continue
         try:
             try:
                 result = api.Command.user_mod(uid,
                     uidnumber=user.uidNumber, gidnumber=user.gidNumber,
                     **kw)
+                #result1 = api.Command.idoverrideuser_mod(uid, **kwovr)
                 print('MOD', uid)
             except ipalib.errors.EmptyModlist as e:
                 print('   ', uid)
                 continue
             except ipalib.errors.NotFound as e:
                 result = api.Command.user_add(uid,
-                    uidnumber=user.uidNumber, gidnumber=user.gidNumber,
+                    #uidnumber=user.uidNumber, gidnumber=user.gidNumber,
+                    #uidnumber=None, gidnumber=None,
+                    gidnumber=10000,
                     **kw)
+                print(result)
+                #kwovr['ipaanchoruuid'] = result['result']['ipauniqueid'][0]
+                #result1 = api.Command.idoverrideuser_add('xsos', result['result']['uid'][0], **kwovr)
+                #result1 = api.Command.idoverrideuser_add('xsos', result['result']['ipauniqueid'][0], **kwovr)
                 print('ADD', uid)
         except Exception as e:
             print('-----------')

@@ -38,17 +38,7 @@ user.user.takes_params += (
     ),
 )
 
-KNOWN_ACCESSES = (
-    'staff',
-    'vorstand',
-    'buero',
-    'multiplex',
-    'studio',
-    'filmteam',
-    'digital',
-    'foto',
-    'vsos',
-)
+
 
 register = Registry()
 
@@ -65,6 +55,23 @@ class AccessChangeManager(object):
         self._old.update(self._parse_accesses(old_access), case=True)
         self._new.update(self._parse_accesses(new_access))
         self.fill_gaps()
+        self.known_accesses_mtime = 0
+        self.reload_known_accesses()
+
+    def reload_known_accesses(self):
+        f = '/etc/ipa/doorlist.txt'
+        mtime = os.stat(f).st_mtime
+        doors = []
+        if mtime <= self.known_accesses_mtime:
+            return
+        with codecs.open(f, 'r', 'utf-8') as fh:
+            for door in fh:
+                door = door.strip()
+                if not door or door.startswith('#'):
+                    continue
+                if door not in doors:
+                    doors.append(door)
+        self.known_accesses = doors
 
     def _parse_accesses(self, acc_list, case=False):
         accesses = {}
@@ -96,13 +103,14 @@ class AccessChangeManager(object):
             yield acc, accesses[acc]
 
     def fill_gaps(self):
+        self.reload_known_accesses()
         for acc in self._old:
             if acc not in self._new:
                 self._new[acc] = self.DISABLED
         for acc in list(self._new):
             if self._new[acc] != self.DISABLED:
                 continue
-            if acc not in KNOWN_ACCESSES:
+            if acc not in self.known_accesses:
                 del self._new[acc]
 
     def get_access(self):
